@@ -72,7 +72,7 @@ app.get('/health', (req, res) => {
 // Start the application
 async function startApp() {
   try {
-    console.log('🚀 Starting Driver Helper Bot...');
+    console.log('🚀 Starting Driver Helper Bot with hot reloading enabled!');
 
     // Setup database
     console.log('📊 Setting up database...');

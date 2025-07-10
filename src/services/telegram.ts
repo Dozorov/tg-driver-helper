@@ -198,6 +198,30 @@ export const telegramService = {
       await this.showHelp(ctx);
     });
 
+    bot.command('cancel', async (ctx) => {
+      const telegramId = ctx.from?.id;
+      if (!telegramId) return;
+
+      // Check for driver_reply session
+      const driverReplySession = await dbOperations.getUserSession(telegramId, 'driver_reply');
+      if (driverReplySession) {
+        await dbOperations.deleteUserSession(telegramId, 'driver_reply');
+        await ctx.reply('❌ Reply mode cancelled. You can now use the main menu.');
+        return;
+      }
+
+      // Check for hr_message session
+      const hrMessageSession = await dbOperations.getUserSession(telegramId, 'hr_message');
+      if (hrMessageSession) {
+        await dbOperations.deleteUserSession(telegramId, 'hr_message');
+        await ctx.reply('❌ Message cancelled.');
+        return;
+      }
+
+      // If no session found
+      await ctx.reply('There is no active session to cancel.');
+    });
+
     console.log('✅ Commands setup completed');
   },
 
@@ -232,12 +256,12 @@ export const telegramService = {
 
   setupOnboardingHandlers() {
     // Remove the text handler from here since it will be handled in setupAdminHandlers
-    bot.on(message('photo'), async (ctx) => {
+    bot.on(message('photo'), async (ctx, next) => {
       const telegramId = ctx.from?.id;
-      if (!telegramId) return;
+      if (!telegramId) return next();
 
       const session = await dbOperations.getUserSession(telegramId, 'onboarding');
-      if (!session) return;
+      if (!session) return next();
 
       await this.handleOnboardingPhoto(ctx, session);
     });
@@ -560,6 +584,44 @@ To message: /message ${driver.id}
       await this.listDriversForHR(ctx);
     });
 
+    // Handler for persistent reply keyboard actions (move these up)
+    bot.hears('💬 Message HR', async (ctx) => {
+      await this.startDriverMessage(ctx, 'hr');
+    });
+    bot.hears('📊 View Status', async (ctx) => {
+      await this.checkStatus(ctx);
+    });
+    bot.hears('📝 Update Profile', async (ctx) => {
+      // Show sub-menu for profile update
+      await ctx.reply('What would you like to update?', {
+        reply_markup: {
+          keyboard: [
+            ['🚗 Driver License', '🏥 Medical Card'],
+            ['⬅️ Back to Menu']
+          ],
+          resize_keyboard: true,
+          one_time_keyboard: false,
+        }
+      });
+    });
+    bot.hears('🚗 Driver License', async (ctx) => {
+      const telegramId = ctx.from?.id;
+      if (!telegramId) return;
+      // Set session for profile update (driver license)
+      await dbOperations.createUserSession(telegramId, 'profile_update', 1, { type: 'driver_license' });
+      await ctx.reply('Please send a new photo of your Driver License or type /cancel to abort.');
+    });
+    bot.hears('🏥 Medical Card', async (ctx) => {
+      const telegramId = ctx.from?.id;
+      if (!telegramId) return;
+      // Set session for profile update (medical card)
+      await dbOperations.createUserSession(telegramId, 'profile_update', 1, { type: 'medical_card' });
+      await ctx.reply('Please send a new photo of your Medical Card or type /cancel to abort.');
+    });
+    bot.hears('⬅️ Back to Menu', async (ctx) => {
+      await this.showMainMenu(ctx);
+    });
+
     // Universal text message handler - handles all text messages with proper priority
     bot.on(message('text'), async (ctx) => {
       console.log('📨 Universal text handler called:', ctx.message.text);
@@ -600,6 +662,40 @@ To message: /message ${driver.id}
         return;
       }
 
+      // Priority 4: Check if user is in profile update date mode
+      const profileUpdateDateSession = await dbOperations.getUserSession(telegramId, 'profile_update_date');
+      console.log('  Profile update date session found:', profileUpdateDateSession);
+      if (profileUpdateDateSession) {
+        console.log('  Processing profile update date...');
+        const text = ctx.message.text;
+        if (!text) return;
+        // Validate date format
+        if (!this.isValidDateFormat(text)) {
+          await ctx.reply('❌ Please enter the date in YYYY-MM-DD format (e.g., 2025-12-31):');
+          return;
+        }
+        if (this.isDateExpired(text)) {
+          await ctx.reply('❌ This date is in the past. Please provide a valid, non-expired date:');
+          return;
+        }
+        const driver = await dbOperations.getDriverByTelegramId(telegramId);
+        if (!driver) {
+          await ctx.reply('❌ You are not registered as a driver.');
+          await dbOperations.deleteUserSession(telegramId, 'profile_update_date');
+          return;
+        }
+        if (profileUpdateDateSession.data.type === 'driver_license') {
+          await dbOperations.updateDriver(driver.id, { cdl_expiry_date: text });
+          await ctx.reply('✅ Your Driver License expiration date has been updated!');
+        } else if (profileUpdateDateSession.data.type === 'medical_card') {
+          await dbOperations.updateDriver(driver.id, { dot_medical_expiry_date: text });
+          await ctx.reply('✅ Your Medical Card expiration date has been updated!');
+        }
+        await dbOperations.deleteUserSession(telegramId, 'profile_update_date');
+        await this.showMainMenu(ctx);
+        return;
+      }
+
       // No active session found
       console.log('❓ No active session found for user, sending default message');
       await ctx.reply('Please use /start to begin onboarding or /help for available commands.');
@@ -620,6 +716,65 @@ To message: /message ${driver.id}
         await ctx.reply('Unknown command. Use /help to see available commands.');
       }
     });
+
+    // Handler for profile update photo
+    bot.on(message('photo'), async (ctx, next) => {
+      const telegramId = ctx.from?.id;
+      console.log('[PHOTO HANDLER] Photo received from:', telegramId);
+      if (!telegramId) return next();
+      const session = await dbOperations.getUserSession(telegramId, 'profile_update');
+      if (!session || !session.data || !session.data.type) {
+        console.log('[PHOTO HANDLER] No profile_update session found for:', telegramId);
+        return next(); // Not in profile update mode
+      }
+      const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
+      if (!photo) {
+        console.log('[PHOTO HANDLER] No photo found in message for:', telegramId);
+        return;
+      }
+      try {
+        console.log('[PHOTO HANDLER] Processing photo for profile update:', session.data.type);
+        const file = await ctx.telegram.getFile(photo.file_id);
+        const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+        const response = await fetch(fileUrl);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const driver = await dbOperations.getDriverByTelegramId(telegramId);
+        if (!driver) {
+          await ctx.reply('❌ You are not registered as a driver.');
+          await dbOperations.deleteUserSession(telegramId, 'profile_update');
+          return;
+        }
+        let uploadedUrl = '';
+        if (session.data.type === 'driver_license') {
+          console.log('[PHOTO HANDLER] Uploading driver license photo for driver:', driver.id);
+          uploadedUrl = await storageService.uploadDriverDocument(buffer, String(driver.id), 'cdl', 'cdl_photo.jpg');
+          await dbOperations.updateDriver(driver.id, { cdl_photo_url: uploadedUrl });
+          // Set session to expect expiration date
+          const createResult = await dbOperations.createUserSession(telegramId, 'profile_update_date', 1, { type: 'driver_license' });
+          console.log('[PHOTO HANDLER] Created profile_update_date session:', createResult);
+          const checkSession = await dbOperations.getUserSession(telegramId, 'profile_update_date');
+          console.log('[PHOTO HANDLER] Immediately fetched profile_update_date session:', checkSession);
+          await ctx.reply('✅ Your Driver License has been updated! Please enter the new expiration date (YYYY-MM-DD):');
+        } else if (session.data.type === 'medical_card') {
+          console.log('[PHOTO HANDLER] Uploading medical card photo for driver:', driver.id);
+          uploadedUrl = await storageService.uploadDriverDocument(buffer, String(driver.id), 'dot_medical', 'dot_medical_photo.jpg');
+          await dbOperations.updateDriver(driver.id, { dot_medical_photo_url: uploadedUrl });
+          // Set session to expect expiration date
+          const createResult = await dbOperations.createUserSession(telegramId, 'profile_update_date', 1, { type: 'medical_card' });
+          console.log('[PHOTO HANDLER] Created profile_update_date session:', createResult);
+          const checkSession = await dbOperations.getUserSession(telegramId, 'profile_update_date');
+          console.log('[PHOTO HANDLER] Immediately fetched profile_update_date session:', checkSession);
+          await ctx.reply('✅ Your Medical Card has been updated! Please enter the new expiration date (YYYY-MM-DD):');
+        }
+        await dbOperations.deleteUserSession(telegramId, 'profile_update');
+        console.log('[PHOTO HANDLER] Profile update photo processed successfully for:', telegramId);
+      } catch (error) {
+        console.error('Error updating document:', error);
+        await ctx.reply('❌ Error updating your document. Please try again.');
+      }
+    });
+
+
   },
 
   async handleApproval(ctx: Context, action: 'approve' | 'reject') {
@@ -657,28 +812,36 @@ To message: /message ${driver.id}
     const driver = await dbOperations.getDriverByTelegramId(telegramId);
     if (!driver) return;
 
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '💰 Request Advance Payment', callback_data: 'request_advance' },
-          { text: '🏖️ Request Vacation', callback_data: 'request_vacation' }
+    let replyKeyboard;
+    if (driver.status === DriverStatus.ACTIVE) {
+      // Approved drivers see all options
+      replyKeyboard = {
+        keyboard: [
+          ['💰 Request Advance Payment', '🏖️ Request Vacation'],
+          ['💬 Message HR', '🆘 Contact Support'],
+          ['📊 View Status', '❓ Help'],
+          ['📝 Update Profile'],
         ],
-        [
-          { text: '💬 Message HR', callback_data: 'message_hr' },
-          { text: '🆘 Contact Support', callback_data: 'message_support' }
+        resize_keyboard: true,
+        one_time_keyboard: false,
+      };
+    } else {
+      // Pending/unapproved drivers see only basic options
+      replyKeyboard = {
+        keyboard: [
+          ['💬 Message HR', '📊 View Status'],
+          ['📝 Update Profile'],
         ],
-        [
-          { text: '📊 Check Status', callback_data: 'check_status' },
-          { text: '❓ Help', callback_data: 'help' }
-        ]
-      ]
-    };
+        resize_keyboard: true,
+        one_time_keyboard: false,
+      };
+    }
 
     await ctx.reply(
       `🚛 Welcome back, ${driver.full_name}!\n\n` +
       `Status: ${driver.status.toUpperCase()}\n\n` +
       `What would you like to do?`,
-      { reply_markup: keyboard }
+      { reply_markup: replyKeyboard }
     );
   },
 
@@ -745,7 +908,12 @@ To message: /message ${driver.id}
 
       const driver = await dbOperations.getDriverByTelegramId(telegramId);
       if (!driver) {
-        await ctx.answerCbQuery('❌ You are not registered as a driver.');
+        // Check if this is a callback query or message
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('❌ You are not registered as a driver.');
+        } else {
+          await ctx.reply('❌ You are not registered as a driver.');
+        }
         return;
       }
 
@@ -753,7 +921,12 @@ To message: /message ${driver.id}
       await dbOperations.createUserSession(telegramId, 'driver_reply', 1, { hrGroupId: department === 'hr' ? (process.env.TELEGRAM_HR_GROUP_ID || '') : (process.env.TELEGRAM_SUPPORT_GROUP_ID || ''), hrUserId: 0 });
 
       const deptName = department === 'hr' ? 'HR' : 'Support';
-      await ctx.answerCbQuery(`💬 Starting chat with ${deptName}`);
+      
+      // Check if this is a callback query or message
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery(`💬 Starting chat with ${deptName}`);
+      }
+      
       await ctx.reply(
         `💬 Message to ${deptName}\n\n` +
         `Type your message below. ${deptName} will receive it immediately.\n\n` +
@@ -761,7 +934,12 @@ To message: /message ${driver.id}
       );
     } catch (error) {
       console.error('Error starting driver message:', error);
-      await ctx.answerCbQuery('❌ Error starting chat.');
+      // Check if this is a callback query or message
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery('❌ Error starting chat.');
+      } else {
+        await ctx.reply('❌ Error starting chat.');
+      }
     }
   },
 
@@ -774,7 +952,10 @@ To message: /message ${driver.id}
       const isHR = process.env.TELEGRAM_HR_GROUP_ID && ctx.chat?.id.toString() === process.env.TELEGRAM_HR_GROUP_ID;
 
       if (isHR) {
-        await ctx.answerCbQuery('📋 HR Help');
+        // Check if this is a callback query or message
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('📋 HR Help');
+        }
         await ctx.reply(
           '🚛 Driver Helper Bot - HR Commands\n\n' +
           'Available commands:\n' +
@@ -785,7 +966,10 @@ To message: /message ${driver.id}
           '/help - Show this help message'
         );
       } else {
-        await ctx.answerCbQuery('📋 Driver Help');
+        // Check if this is a callback query or message
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('📋 Driver Help');
+        }
         await ctx.reply(
           '🚛 Driver Helper Bot\n\n' +
           'Available commands:\n' +
@@ -799,7 +983,12 @@ To message: /message ${driver.id}
       }
     } catch (error) {
       console.error('Error showing help:', error);
-      await ctx.answerCbQuery('❌ Error showing help.');
+      // Check if this is a callback query or message
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery('❌ Error showing help.');
+      } else {
+        await ctx.reply('❌ Error showing help.');
+      }
     }
   },
 
@@ -924,7 +1113,7 @@ To message: /message ${driver.id}
       const replyKeyboard = {
         inline_keyboard: [
           [
-            { text: `Ответить ${driver.full_name}`, callback_data: `reply_driver_${driver.id}` }
+            { text: `Response ${driver.full_name}`, callback_data: `reply_driver_${driver.id}` }
           ]
         ]
       };
